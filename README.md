@@ -27,4 +27,4 @@ cd "Đường_dẫn_đến_thư_mục\Chat Bot LLM"
     hiện ra địa chỉ tương tự http://127.0.0.1:xxxx/
     nhấn ctrl + click để truy cập 
 thực hiện kiểm tra
-
+v2

@@ -1,17 +1,18 @@
 from openai import OpenAI
-import gradio as gr
-import os
 from dotenv import load_dotenv
-from newspaper import Article
-import requests
-from bs4 import BeautifulSoup
-import fitz  # Xử lý PDF
-import re  # Trích xuất URL
+from mongo_module import find_products_by_keyword
+from chat_engine import is_news_query, extract_url, get_latest_news, summarize_article
+from gradioInterface import build_gradio_ui
+import os
+import fitz
 
-# Lưu nội dung PDF
+customer_mode = {"enabled": False}
 pdf_context = {"content": ""}
 
-# Tải PDF
+def toggle_customer_mode(toggle):
+    customer_mode["enabled"] = toggle
+    return f"Tư vấn khách hàng: {'BẬT' if toggle else 'TẮT'}"
+
 def upload_pdf(file):
     text = ""
     try:
@@ -23,103 +24,81 @@ def upload_pdf(file):
     except Exception as e:
         return f"❌ Lỗi đọc PDF: {e}"
 
-# Kiểm tra câu hỏi tin tức
-def is_news_query(text):
-    keywords = ["sự kiện", "tin tức", "thời sự", "mới nhất", "tin nóng"]
-    return any(kw in text.lower() for kw in keywords)
-
-# Lấy tin tức mới
-def get_latest_news():
-    try:
-        url = "https://vnexpress.net/rss/tin-moi-nhat.rss"
-        resp = requests.get(url)
-        soup = BeautifulSoup(resp.content, features="xml")
-        items = soup.findAll("item")[:3]
-        news = "\n\n".join(f"{i+1}. {item.title.text}" for i, item in enumerate(items))
-        return news
-    except Exception as e:
-        return f"Không lấy được tin tức mới: {e}"
-
-# Trích xuất URL nếu có trong câu hỏi
-def extract_url(text):
-    match = re.search(r"https?://\S+", text)
-    return match.group(0) if match else None
-
-# Tóm tắt bài báo
-def summarize_article(url):
-    try:
-        article = Article(url)
-        article.download()
-        article.parse()
-        return article.text
-    except:
-        return "❌ Không thể trích xuất nội dung từ đường link này."
-
-# Load key từ .env
+# Load API Key
 load_dotenv()
 client = OpenAI(
     api_key=os.getenv("GEMINI_API_KEY"),
     base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
 )
 
-# Hàm xử lý chính
+def find_products_by_keyword(keyword):
+    sample_products = [
+        {
+            "name": "iPhone 15 Pro Max",
+            "brand": "Apple",
+            "price": 32990000,
+            "discount": 10,
+            "description": "Flagship mạnh mẽ từ Apple"
+        },
+        {
+            "name": "Samsung Galaxy S24 Ultra",
+            "brand": "Samsung",
+            "price": 28990000,
+            "discount": 12,
+            "description": "Điện thoại cao cấp, camera tốt"
+        }
+    ]
+
+    result = ""
+    for product in sample_products:
+        if keyword.lower() in product["name"].lower() or keyword.lower() in product["brand"].lower():
+            discounted_price = int(product["price"] * (1 - product["discount"]/100))
+            result += f"\n📱 {product['name']} ({product['brand']})\n"
+            result += f"💰 Giá: {product['price']:,}đ (-{product['discount']}%) → {discounted_price:,}đ\n"
+            result += f"ℹ️ Mô tả: {product['description']}\n---\n"
+
+    return result if result else "❌ Không tìm thấy sản phẩm phù hợp."
+
 def chat_with_gemini(message, history):
-    # 1. Hỏi về sự kiện mới
+    if customer_mode["enabled"]:
+        return find_products_by_keyword(message)
+
     if is_news_query(message):
         raw_news = get_latest_news()
-        prompt = f"Hãy tóm tắt và phân tích các sự kiện sau bằng tiếng Việt:\n\n{raw_news}"
+        prompt = f"Hãy tóm tắt và phân tích các sự kiện sau:\n\n{raw_news}"
         response = client.chat.completions.create(
             model="gemini-2.0-flash",
             messages=[{"role": "user", "content": prompt}]
         )
         return response.choices[0].message.content
 
-    # 2. Có chứa URL bài báo
     url = extract_url(message)
     if url:
-        article_text = summarize_article(url)
-        if article_text.startswith("❌") or article_text.startswith("Không thể"):
-            return article_text
-        prompt = f"Tóm tắt bài báo sau bằng tiếng Việt ngắn gọn:\n\n{article_text}"
+        text = summarize_article(url)
+        if text.startswith("❌"): return text
+        prompt = f"Tóm tắt bài báo sau:\n\n{text}"
         response = client.chat.completions.create(
             model="gemini-2.0-flash",
             messages=[{"role": "user", "content": prompt}]
         )
         return response.choices[0].message.content
 
-    # 3. Nếu có PDF thì kết hợp vào prompt
-    prompt = ""
-    if pdf_context["content"]:
-        prompt = f"Dựa vào tài liệu sau, trả lời câu hỏi:\n\n{pdf_context['content']}\n\nCâu hỏi: {message}"
-    else:
-        prompt = message
-
-    # 4. Hội thoại bình thường
+    prompt = pdf_context["content"] and f"Dựa vào tài liệu sau, trả lời:\n\n{pdf_context['content']}\n\nCâu hỏi: {message}" or message
     messages = [{"role": "system", "content": "Bạn là trợ lý AI thân thiện."}]
     for user, bot in history:
-        messages.append({"role": "user", "content": user})
-        messages.append({"role": "assistant", "content": bot})
+        messages.extend([
+            {"role": "user", "content": user},
+            {"role": "assistant", "content": bot}
+        ])
     messages.append({"role": "user", "content": prompt})
 
-    stream = client.chat.completions.create(
-        model="gemini-2.0-flash",
-        messages=messages,
-        stream=True
-    )
-
-    full_reply = ""
+    stream = client.chat.completions.create(model="gemini-2.0-flash", messages=messages, stream=True)
+    reply = ""
     for chunk in stream:
         if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-            full_reply += chunk.choices[0].delta.content
-    return full_reply
+            reply += chunk.choices[0].delta.content
+    return reply
 
-# Giao diện Gradio
-with gr.Blocks() as app:
-    gr.Markdown("## 🤖 ChatBot Gemini")
-    pdf_upload = gr.File(label="📄 Tải lên file PDF", file_types=[".pdf"])
-    upload_status = gr.Textbox(label="Trạng thái đọc file", interactive=False)
-    chatbot = gr.ChatInterface(fn=chat_with_gemini)
-    pdf_upload.change(fn=upload_pdf, inputs=pdf_upload, outputs=upload_status)
-
-# Mở ứng dụng
+# Khởi chạy app
+app = build_gradio_ui(chat_with_gemini, upload_pdf, toggle_customer_mode)
 app.launch()
